@@ -1,6 +1,7 @@
 
 import { google } from 'googleapis';
-import { promises as fs } from 'fs';
+import fs from 'fs';
+import { promises as fsPromises } from 'fs';
 import path from 'path';
 import process from 'process';
 import axios from 'axios';
@@ -11,6 +12,7 @@ import { createInterface } from 'readline';
 const CLIENT_SECRETS_PATH = 'client_secrets.json';
 const TOKEN_PATH = 'token.json';
 const REMOTE_XLSX_URL = 'https://raw.githubusercontent.com/swipeviewer99-ai/video-uploader-new/main/SEOVideos_updated.xlsx';
+const LOCAL_XLSX_PATH = 'SEOVideos_updated.xlsx';
 
 const SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl'];
 
@@ -22,7 +24,7 @@ const OAuth2 = google.auth.OAuth2;
  */
 async function getClientSecrets() {
     try {
-        const content = await fs.readFile(CLIENT_SECRETS_PATH);
+        const content = await fsPromises.readFile(CLIENT_SECRETS_PATH);
         return JSON.parse(content);
     } catch (err) {
         console.warn('Warning: client_secrets.json not found. Skipping authentication for dry run.');
@@ -46,7 +48,7 @@ async function authenticate() {
 
     // Check for a previously saved token.
     try {
-        const token = await fs.readFile(TOKEN_PATH);
+        const token = await fsPromises.readFile(TOKEN_PATH);
         client.setCredentials(JSON.parse(token));
         console.log('Authentication successful from saved token.');
         return client;
@@ -76,7 +78,7 @@ async function getNewToken(client) {
             try {
                 const { tokens } = await client.getToken(code);
                 client.setCredentials(tokens);
-                await fs.writeFile(TOKEN_PATH, JSON.stringify(tokens));
+                await fsPromises.writeFile(TOKEN_PATH, JSON.stringify(tokens));
                 console.log('Token stored to', TOKEN_PATH);
                 console.log('Authentication successful.');
                 resolve(client);
@@ -124,7 +126,7 @@ async function getRemoteExcelData() {
             return obj;
         });
 
-        return rows;
+        return { rows, workbook, sheetName, headers };
     } catch (error) {
         console.error('Error downloading or parsing Excel:', error.message);
         throw error;
@@ -141,24 +143,80 @@ function extractVideoId(url) {
 }
 
 /**
+ * Updates the local Excel file to mark a video as updated.
+ */
+async function markVideoAsUpdated(videoData, index) {
+    try {
+        // Assume local file exists and is initialized
+        if (!fs.existsSync(LOCAL_XLSX_PATH)) {
+             console.error("Local file not initialized. Cannot update status.");
+             return;
+        }
+
+        const workbook = xlsx.readFile(LOCAL_XLSX_PATH);
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+
+        // Convert to JSON (array of arrays)
+        const data = xlsx.utils.sheet_to_json(worksheet, { header: 1 });
+        const headers = data[0];
+
+        // Find or add 'updated_description' column
+        let statusColIndex = headers.indexOf('updated_description');
+        if (statusColIndex === -1) {
+            headers.push('updated_description');
+            statusColIndex = headers.length - 1;
+            data[0] = headers; // Update header row
+        }
+
+        // Update the specific row
+        // note: 'index' passed from main loop is 0-based index of data rows (excluding header)
+        // so actual row in 'data' array is index + 1
+        const rowIndex = index + 1;
+
+        if (data[rowIndex]) {
+            // Ensure row has enough columns
+            while (data[rowIndex].length <= statusColIndex) {
+                data[rowIndex].push('');
+            }
+            data[rowIndex][statusColIndex] = 'yes';
+        } else {
+             console.error(`Row ${rowIndex} not found in local Excel data.`);
+        }
+
+        // Write back to file
+        const newSheet = xlsx.utils.aoa_to_sheet(data);
+        workbook.Sheets[sheetName] = newSheet;
+        xlsx.writeFile(workbook, LOCAL_XLSX_PATH);
+        console.log(`Updated Excel status for row ${rowIndex} to 'yes'.`);
+
+    } catch (err) {
+        console.error(`Error updating Excel status for row ${index}:`, err.message);
+    }
+}
+
+/**
+ * Initialize local Excel file from remote data
+ */
+function initializeLocalExcel(workbook) {
+    xlsx.writeFile(workbook, LOCAL_XLSX_PATH);
+    console.log(`Initialized local Excel file at ${LOCAL_XLSX_PATH}`);
+}
+
+
+/**
  * Updates the video description on YouTube.
  */
 async function updateVideoDescription(auth, videoId, newDescription) {
     if (!auth) {
         console.log(`[DRY RUN] Would update video ID: ${videoId}`);
-        // console.log(`[DRY RUN] New Description Preview: ${newDescription.substring(0, 50)}...`);
-        return;
+        return true; // Simulate success
     }
 
     // Truncate description if it's too long (safeguard)
     if (newDescription.length > 4900) {
         console.warn(`WARNING: Description for video ${videoId} is ${newDescription.length} chars. Truncating to 4900.`);
         newDescription = newDescription.substring(0, 4900);
-    }
-
-    // Check for angle brackets (basic HTML check)
-    if (newDescription.includes('<') || newDescription.includes('>')) {
-        console.warn(`WARNING: Description for video ${videoId} contains potentially invalid characters (< or >).`);
     }
 
     try {
@@ -171,7 +229,7 @@ async function updateVideoDescription(auth, videoId, newDescription) {
 
         if (response.data.items.length === 0) {
             console.warn(`Video not found for ID: ${videoId}`);
-            return;
+            return false;
         }
 
         const videoSnippet = response.data.items[0].snippet;
@@ -179,7 +237,7 @@ async function updateVideoDescription(auth, videoId, newDescription) {
 
         if (currentDescription === newDescription) {
             console.log(`Description for video ${videoId} is already up to date.`);
-            return;
+            return true; // Considered success as state is correct
         }
 
         // 2. Update the description
@@ -195,15 +253,14 @@ async function updateVideoDescription(auth, videoId, newDescription) {
         });
 
         console.log(`Successfully updated description for video ID: ${videoId}`);
+        return true;
 
     } catch (error) {
         console.error(`Failed to update video ${videoId}:`, error.message);
-        // Log more specific error details if available
         if (error.response && error.response.data && error.response.data.error) {
             console.error('API Error Details:', JSON.stringify(error.response.data.error, null, 2));
-        } else if (error.errors) {
-             console.error('Error Object:', JSON.stringify(error.errors, null, 2));
         }
+        return false;
     }
 }
 
@@ -213,30 +270,19 @@ async function updateVideoDescription(auth, videoId, newDescription) {
 async function main() {
     try {
         const auth = await authenticate();
-        const videoData = await getRemoteExcelData();
+        const { rows, workbook } = await getRemoteExcelData();
 
-        console.log(`Found ${videoData.length} rows in Excel.`);
+        // Initialize local file to work with
+        initializeLocalExcel(workbook);
 
-        // Log first few rows description length for debugging
-        if (videoData.length > 0) {
-             console.log('--- DEBUG: First few rows description check ---');
-             for(let i=0; i<Math.min(3, videoData.length); i++) {
-                 const desc = videoData[i]['YouTube Description'] || '';
-                 const id = extractVideoId(videoData[i]['YouTube URL']);
-                 console.log(`Row ${i+1} (ID: ${id}): Length=${desc.length} chars. Contains '<'=${desc.includes('<')}, Contains '>'=${desc.includes('>')}`);
-             }
-             console.log('--- END DEBUG ---');
-        }
+        console.log(`Found ${rows.length} rows in Excel.`);
 
-
-        for (const row of videoData) {
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
             const youtubeUrl = row['YouTube URL'];
             const newDescription = row['YouTube Description'];
 
-            if (!youtubeUrl) {
-                // console.log('Skipping row: No YouTube URL found.', row);
-                continue;
-            }
+            if (!youtubeUrl) continue;
 
             const videoId = extractVideoId(youtubeUrl);
             if (!videoId) {
@@ -250,7 +296,11 @@ async function main() {
             }
 
             console.log(`Processing Video ID: ${videoId}...`);
-            await updateVideoDescription(auth, videoId, newDescription);
+            const success = await updateVideoDescription(auth, videoId, newDescription);
+
+            if (success) {
+                await markVideoAsUpdated(row, i);
+            }
         }
 
         console.log('All updates completed.');
