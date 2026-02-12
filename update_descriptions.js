@@ -21,8 +21,13 @@ const OAuth2 = google.auth.OAuth2;
  * Reads the local client secrets file.
  */
 async function getClientSecrets() {
-    const content = await fs.readFile(CLIENT_SECRETS_PATH);
-    return JSON.parse(content);
+    try {
+        const content = await fs.readFile(CLIENT_SECRETS_PATH);
+        return JSON.parse(content);
+    } catch (err) {
+        console.warn('Warning: client_secrets.json not found. Skipping authentication for dry run.');
+        return null;
+    }
 }
 
 /**
@@ -31,6 +36,8 @@ async function getClientSecrets() {
 async function authenticate() {
     console.log('Authenticating...');
     const secrets = await getClientSecrets();
+    if (!secrets) return null; // Return null if secrets are missing (dry run mode)
+
     const client = new OAuth2(
         secrets.installed.client_id,
         secrets.installed.client_secret,
@@ -137,6 +144,23 @@ function extractVideoId(url) {
  * Updates the video description on YouTube.
  */
 async function updateVideoDescription(auth, videoId, newDescription) {
+    if (!auth) {
+        console.log(`[DRY RUN] Would update video ID: ${videoId}`);
+        // console.log(`[DRY RUN] New Description Preview: ${newDescription.substring(0, 50)}...`);
+        return;
+    }
+
+    // Truncate description if it's too long (safeguard)
+    if (newDescription.length > 4900) {
+        console.warn(`WARNING: Description for video ${videoId} is ${newDescription.length} chars. Truncating to 4900.`);
+        newDescription = newDescription.substring(0, 4900);
+    }
+
+    // Check for angle brackets (basic HTML check)
+    if (newDescription.includes('<') || newDescription.includes('>')) {
+        console.warn(`WARNING: Description for video ${videoId} contains potentially invalid characters (< or >).`);
+    }
+
     try {
         // 1. Get current video details (snippet) to preserve title, tags, etc.
         const response = await youtube.videos.list({
@@ -174,6 +198,12 @@ async function updateVideoDescription(auth, videoId, newDescription) {
 
     } catch (error) {
         console.error(`Failed to update video ${videoId}:`, error.message);
+        // Log more specific error details if available
+        if (error.response && error.response.data && error.response.data.error) {
+            console.error('API Error Details:', JSON.stringify(error.response.data.error, null, 2));
+        } else if (error.errors) {
+             console.error('Error Object:', JSON.stringify(error.errors, null, 2));
+        }
     }
 }
 
@@ -186,6 +216,18 @@ async function main() {
         const videoData = await getRemoteExcelData();
 
         console.log(`Found ${videoData.length} rows in Excel.`);
+
+        // Log first few rows description length for debugging
+        if (videoData.length > 0) {
+             console.log('--- DEBUG: First few rows description check ---');
+             for(let i=0; i<Math.min(3, videoData.length); i++) {
+                 const desc = videoData[i]['YouTube Description'] || '';
+                 const id = extractVideoId(videoData[i]['YouTube URL']);
+                 console.log(`Row ${i+1} (ID: ${id}): Length=${desc.length} chars. Contains '<'=${desc.includes('<')}, Contains '>'=${desc.includes('>')}`);
+             }
+             console.log('--- END DEBUG ---');
+        }
+
 
         for (const row of videoData) {
             const youtubeUrl = row['YouTube URL'];
