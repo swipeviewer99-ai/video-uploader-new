@@ -270,15 +270,55 @@ async function updateVideoDescription(auth, videoId, newDescription) {
 async function main() {
     try {
         const auth = await authenticate();
-        const { rows, workbook } = await getRemoteExcelData();
 
-        // Initialize local file to work with
-        initializeLocalExcel(workbook);
+        // 1. Check if local Excel file exists and use it if so (to preserve progress)
+        let rows, workbook;
 
-        console.log(`Found ${rows.length} rows in Excel.`);
+        if (fs.existsSync(LOCAL_XLSX_PATH)) {
+            console.log(`Using existing local Excel file: ${LOCAL_XLSX_PATH}`);
+            workbook = xlsx.readFile(LOCAL_XLSX_PATH);
+            const sheetName = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[sheetName];
+            const data = xlsx.utils.sheet_to_json(worksheet, { header: 1 });
+            const headers = data[0];
+            console.log('Headers found:', headers);
+
+            rows = data.slice(1).map(row => {
+                const obj = {};
+                headers.forEach((header, index) => {
+                    obj[header] = row[index];
+                });
+                // Fallback for missing header match on YouTube URL if needed (less likely on local re-read but good safety)
+                if (!obj['YouTube URL'] && row.length > headers.length) {
+                     const lastElement = row[row.length - 1];
+                     if (typeof lastElement === 'string' && lastElement.includes('youtube.com')) {
+                         obj['YouTube URL'] = lastElement;
+                     }
+                }
+                return obj;
+            });
+
+        } else {
+            // 2. Otherwise download from remote
+            const result = await getRemoteExcelData();
+            rows = result.rows;
+            workbook = result.workbook;
+            // Initialize local file immediately so we can start tracking updates
+            initializeLocalExcel(workbook);
+        }
+
+
+        console.log(`Found ${rows.length} rows to process.`);
 
         for (let i = 0; i < rows.length; i++) {
             const row = rows[i];
+
+            // Check if already updated
+            if (row['updated_description'] && row['updated_description'].toString().toLowerCase() === 'yes') {
+                // console.log(`Skipping row ${i+1}: Already updated.`);
+                continue;
+            }
+
             const youtubeUrl = row['YouTube URL'];
             const newDescription = row['YouTube Description'];
 
